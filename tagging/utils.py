@@ -5,9 +5,13 @@ calculation.
 import math
 
 from django.utils import six
+from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils.encoding import force_text
 from django.utils.translation import ugettext as _
+
+from modeltranslation.translator import translator
+from operator import __or__ as OR
 
 # Font size distribution algorithms
 LOGARITHMIC, LINEAR = 1, 2
@@ -209,7 +213,11 @@ def get_tag(tag):
 
     try:
         if isinstance(tag, six.string_types):
-            return Tag.objects.get(name=tag)
+            name_fields_name = ['name']
+            if Tag in translator.get_registered_models():
+                name_fields_name += [_.attname for _ in translator.get_options_for_model(Tag).fields.get('name', [])]
+            conditions = [Q(**{_:tag}) for _ in name_fields_name]
+            return Tag.objects.filter(reduce(OR, conditions)).first()
         elif isinstance(tag, six.integer_types):
             return Tag.objects.get(id=tag)
     except Tag.DoesNotExist:

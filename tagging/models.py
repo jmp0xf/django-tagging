@@ -3,11 +3,15 @@ Models and managers for tagging.
 """
 from django.db import models
 from django.db import connection
+from django.db.models import Q
 from django.utils.encoding import smart_text
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes.fields import GenericForeignKey
+
+from modeltranslation.translator import translator
+from operator import __or__ as OR
 
 from tagging import settings
 from tagging.utils import LOGARITHMIC
@@ -30,6 +34,10 @@ class TagManager(models.Manager):
         """
         Update tags associated with an object.
         """
+        name_fields_name = ['name']
+        if self.model in translator.get_registered_models():
+            name_fields_name += [_.attname for _ in translator.get_options_for_model(self.model).fields.get('name', [])]
+
         ctype = ContentType.objects.get_for_model(obj)
         current_tags = list(self.filter(items__content_type__pk=ctype.pk,
                                         items__object_id=obj.pk))
@@ -39,17 +47,22 @@ class TagManager(models.Manager):
 
         # Remove tags which no longer apply
         tags_for_removal = [tag for tag in current_tags
-                            if tag.name not in updated_tag_names]
+                            if not any([getattr(tag, _) in updated_tag_names for _ in name_fields_name])]
         if len(tags_for_removal):
             TaggedItem._default_manager.filter(
                 content_type__pk=ctype.pk,
                 object_id=obj.pk,
                 tag__in=tags_for_removal).delete()
+
         # Add new tags
-        current_tag_names = [tag.name for tag in current_tags]
+        current_tag_names = [getattr(tag, field_name) for tag in current_tags for field_name in name_fields_name]
+
         for tag_name in updated_tag_names:
             if tag_name not in current_tag_names:
-                tag, created = self.get_or_create(name=tag_name)
+                conditions = [Q(**{_:tag_name}) for _ in name_fields_name]
+                tag = self.filter(reduce(OR, conditions)).first()
+                if not tag:
+                    tag = self.create(name=tag_name)
                 TaggedItem._default_manager.create(tag=tag, object=obj)
 
     def add_tag(self, obj, tag_name):
@@ -91,8 +104,13 @@ class TagManager(models.Manager):
 
         model_table = qn(model._meta.db_table)
         model_pk = '%s.%s' % (model_table, qn(model._meta.pk.column))
+
+        tag = qn(self.model._meta.db_table)
+        columns = [_.attname for _ in self.model._meta.fields]
+        columns_placeholder = ', '.join(['%(tag)s.%(column)s' % {'tag': tag, 'column': _,} for _ in columns])
+
         query = """
-        SELECT DISTINCT %(tag)s.id, %(tag)s.name%(count_sql)s
+        SELECT DISTINCT %(columns_placeholder)s%(count_sql)s
         FROM
             %(tag)s
             INNER JOIN %(tagged_item)s
@@ -105,7 +123,8 @@ class TagManager(models.Manager):
         GROUP BY %(tag)s.id, %(tag)s.name
         %%s
         ORDER BY %(tag)s.name ASC""" % {
-            'tag': qn(self.model._meta.db_table),
+            'tag': tag,
+            'columns_placeholder': columns_placeholder,
             'count_sql': counts and (', COUNT(%s)' % model_pk) or '',
             'tagged_item': qn(TaggedItem._meta.db_table),
             'model': model_table,
@@ -123,9 +142,9 @@ class TagManager(models.Manager):
                        params)
         tags = []
         for row in cursor.fetchall():
-            t = self.model(*row[:2])
+            t = self.model(**dict(zip(columns, row)))
             if counts:
-                t.count = row[2]
+                t.count = row[-1]
             tags.append(t)
         return tags
 
